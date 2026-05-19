@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import Any
+import time
 import zarr
 import xarray as xr
 
@@ -44,14 +45,26 @@ def _write_level(
 
 def _open_level(store: Any, level: int) -> xr.Dataset:
     if _is_fsmap(store):
-        # zarr v3 raises ValueError if group/path is passed alongside an FSMap.
-        # Opening the sub-mapper as a zarr Group first converts it to a native
-        # FsspecStore, which xr.open_zarr accepts without the restriction.
         sub = _sub_mapper(store, level)
+        # zarr.open_group converts FSMap → FsspecStore internally.
+        # Extracting .store_path.store gives the native FsspecStore, which
+        # xr.open_zarr accepts without the FSMap+path restriction.
         zarr_group = zarr.open_group(sub, mode="r")
-        return xr.open_zarr(zarr_group, consolidated=False)
+        return xr.open_zarr(zarr_group.store_path.store, consolidated=False)
     else:
         return xr.open_zarr(store, group=str(level), consolidated=False)
+
+
+def _print_level_start(
+    i: int, n_levels: int, ds: xr.Dataset, x_dim: str, y_dim: str
+) -> None:
+    ny = ds.sizes.get(y_dim, "?")
+    nx = ds.sizes.get(x_dim, "?")
+    print(f"[{i + 1}/{n_levels}] Writing level {i}  ({ny} x {nx})", flush=True)
+
+
+def _print_level_done(i: int, n_levels: int, elapsed: float) -> None:
+    print(f"[{i + 1}/{n_levels}] Level {i} done  ({elapsed:.1f}s)", flush=True)
 
 
 def write_pyramid(
@@ -104,7 +117,11 @@ def write_pyramid(
     root.attrs.update(pyramid.dt.attrs)
 
     # Level 0 is the finest resolution — write directly from the pyramid DataTree.
-    _write_level(pyramid.dt["/0"].ds, store, 0, pyramid.encoding["/0"], zarr_format)
+    ds0 = pyramid.dt["/0"].ds
+    _print_level_start(0, n_levels, ds0, x_dim, y_dim)
+    t0 = time.perf_counter()
+    _write_level(ds0, store, 0, pyramid.encoding["/0"], zarr_format)
+    _print_level_done(0, n_levels, time.perf_counter() - t0)
 
     # For each subsequent level, read the previous level back from zarr to get
     # fresh dask arrays (no chained dependency on level 0's full-resolution data),
@@ -126,7 +143,10 @@ def write_pyramid(
             if var in template_ds:
                 curr_ds[var].attrs = template_ds[var].attrs
 
+        _print_level_start(i, n_levels, template_ds, x_dim, y_dim)
+        t0 = time.perf_counter()
         _write_level(curr_ds, store, i, enc, zarr_format)
+        _print_level_done(i, n_levels, time.perf_counter() - t0)
 
     if consolidated and zarr_format != 3:
         zarr.consolidate_metadata(store)

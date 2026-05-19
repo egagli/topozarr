@@ -96,6 +96,39 @@ def test_write_pyramid_encoding(create_dataset, tmp_path):
     assert z["0"]["elevation"].dtype == np.int16
 
 
+def test_write_pyramid_fsmap(create_dataset):
+    """write_pyramid works correctly with FSMap stores (e.g. adlfs, gcsfs).
+
+    Uses fsspec's in-memory filesystem as a drop-in stand-in for Azure Blob
+    Storage — same FSMap interface, no credentials required.
+    """
+    fsspec = pytest.importorskip("fsspec")
+
+    ds = create_dataset(nx=32, ny=32)
+    pyramid = create_pyramid(ds, levels=3)
+
+    mem_fs = fsspec.filesystem("memory")
+    store = mem_fs.get_mapper("/test/pyramid")
+
+    write_pyramid(pyramid, store, zarr_format=3)
+
+    # Root attrs written correctly
+    root_attrs = dict(zarr.open_group(store, mode="r").attrs)
+    assert "multiscales" in root_attrs
+    assert "proj:code" in root_attrs
+
+    # Each level has the correct shape and is readable.
+    # Use store_path.store to get the native FsspecStore — same pattern as _open_level.
+    for i in range(3):
+        sub = mem_fs.get_mapper(f"/test/pyramid/{i}")
+        fss = zarr.open_group(sub, mode="r").store_path.store
+        level_ds = xr.open_zarr(fss, consolidated=False)
+        expected = pyramid.dt[f"/{i}"].ds["elevation"].shape
+        assert level_ds["elevation"].shape == expected, (
+            f"FSMap level {i}: got {level_ds['elevation'].shape}, expected {expected}"
+        )
+
+
 def test_write_pyramid_custom_dims(create_dataset, tmp_path):
     """write_pyramid respects custom x_dim/y_dim/method arguments."""
     ds = create_dataset(x_dim="lon", y_dim="lat")
