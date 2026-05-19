@@ -43,14 +43,32 @@ def _write_level(
         )
 
 
-def _open_level(store: Any, level: int) -> xr.Dataset:
+def _open_level(
+    store: Any,
+    level: int,
+    encoding: dict | None = None,
+    template: xr.Dataset | None = None,
+) -> xr.Dataset:
     if _is_fsmap(store):
+        import numpy as np
+        import dask.array as da
+
         sub = _sub_mapper(store, level)
-        # zarr.open_group converts FSMap → FsspecStore internally.
-        # Extracting .store_path.store gives the native FsspecStore, which
-        # xr.open_zarr accepts without the FSMap+path restriction.
-        zarr_group = zarr.open_group(sub, mode="r")
-        return xr.open_zarr(zarr_group.store_path.store, consolidated=False)
+        zarr_grp = zarr.open_group(sub, mode="r")
+
+        data_vars = {}
+        for var in template.data_vars:
+            raw = da.from_zarr(zarr_grp[var]).astype("float32")
+            fill = (encoding or {}).get(var, {}).get("_FillValue")
+            if fill is not None:
+                raw = da.where(raw == fill, np.nan, raw)
+            data_vars[var] = xr.DataArray(raw, dims=template[var].dims)
+
+        coords = {
+            k: (v.compute() if hasattr(v, "compute") else v)
+            for k, v in template.coords.items()
+        }
+        return xr.Dataset(data_vars, coords=coords, attrs=template.attrs)
     else:
         return xr.open_zarr(store, group=str(level), consolidated=False)
 
@@ -131,7 +149,9 @@ def write_pyramid(
         template_ds = pyramid.dt[f"/{i}"].ds
 
         # Opening from zarr breaks the dask graph chain.
-        prev_ds = _open_level(store, i - 1)
+        prev_template = pyramid.dt[f"/{i - 1}"].ds
+        prev_enc = pyramid.encoding[f"/{i - 1}"]
+        prev_ds = _open_level(store, i - 1, encoding=prev_enc, template=prev_template)
 
         curr_ds = getattr(
             prev_ds.coarsen({x_dim: 2, y_dim: 2}, boundary="trim"), method

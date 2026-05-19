@@ -117,12 +117,14 @@ def test_write_pyramid_fsmap(create_dataset):
     assert "multiscales" in root_attrs
     assert "proj:code" in root_attrs
 
-    # Each level has the correct shape and is readable.
-    # Use store_path.store to get the native FsspecStore — same pattern as _open_level.
+    # Each level has the correct shape and is readable via _open_level.
+    from topozarr.write import _open_level
     for i in range(3):
-        sub = mem_fs.get_mapper(f"/test/pyramid/{i}")
-        fss = zarr.open_group(sub, mode="r").store_path.store
-        level_ds = xr.open_zarr(fss, consolidated=False)
+        level_ds = _open_level(
+            store, i,
+            encoding=pyramid.encoding[f"/{i}"],
+            template=pyramid.dt[f"/{i}"].ds,
+        )
         expected = pyramid.dt[f"/{i}"].ds["elevation"].shape
         assert level_ds["elevation"].shape == expected, (
             f"FSMap level {i}: got {level_ds['elevation'].shape}, expected {expected}"
