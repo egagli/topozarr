@@ -4,21 +4,54 @@ import zarr
 import xarray as xr
 
 
-def _level_store(store: Any, level: int) -> tuple[Any, str | None]:
-    """Return (store, group) for accessing a pyramid level subgroup.
-
-    zarr v3 raises ValueError if a path/group argument is passed alongside an
-    FSMap (fsspec) store — the subgroup path must be embedded in the mapper
-    instead.  For all other store types the caller can pass group= as usual.
-    """
+def _is_fsmap(store: Any) -> bool:
     try:
         from fsspec.mapping import FSMap
-        if isinstance(store, FSMap):
-            root = store.root.rstrip("/")
-            return store.fs.get_mapper(f"{root}/{level}"), None
+        return isinstance(store, FSMap)
     except ImportError:
-        pass
-    return store, str(level)
+        return False
+
+
+def _sub_mapper(store: Any, level: int) -> Any:
+    return store.fs.get_mapper(store.root.rstrip("/") + "/" + str(level))
+
+
+def _write_level(
+    ds: xr.Dataset,
+    store: Any,
+    level: int,
+    encoding: dict,
+    zarr_format: int,
+) -> None:
+    if _is_fsmap(store):
+        ds.to_zarr(
+            _sub_mapper(store, level),
+            mode="a",
+            encoding=encoding,
+            zarr_format=zarr_format,
+            consolidated=False,
+        )
+    else:
+        ds.to_zarr(
+            store,
+            group=str(level),
+            mode="a",
+            encoding=encoding,
+            zarr_format=zarr_format,
+            consolidated=False,
+        )
+
+
+def _open_level(store: Any, level: int) -> xr.Dataset:
+    if _is_fsmap(store):
+        # zarr v3 raises ValueError if group/path is passed alongside an FSMap.
+        # Opening the sub-mapper as a zarr Group first converts it to a native
+        # FsspecStore, which xr.open_zarr accepts without the restriction.
+        sub = _sub_mapper(store, level)
+        zarr_group = zarr.open_group(sub, mode="r")
+        return xr.open_zarr(zarr_group, consolidated=False)
+    else:
+        return xr.open_zarr(store, group=str(level), consolidated=False)
 
 
 def write_pyramid(
@@ -71,15 +104,7 @@ def write_pyramid(
     root.attrs.update(pyramid.dt.attrs)
 
     # Level 0 is the finest resolution — write directly from the pyramid DataTree.
-    level_store, group = _level_store(store, 0)
-    pyramid.dt["/0"].ds.to_zarr(
-        level_store,
-        group=group,
-        mode="a",
-        encoding=pyramid.encoding["/0"],
-        zarr_format=zarr_format,
-        consolidated=False,
-    )
+    _write_level(pyramid.dt["/0"].ds, store, 0, pyramid.encoding["/0"], zarr_format)
 
     # For each subsequent level, read the previous level back from zarr to get
     # fresh dask arrays (no chained dependency on level 0's full-resolution data),
@@ -89,8 +114,7 @@ def write_pyramid(
         template_ds = pyramid.dt[f"/{i}"].ds
 
         # Opening from zarr breaks the dask graph chain.
-        prev_store, prev_group = _level_store(store, i - 1)
-        prev_ds = xr.open_zarr(prev_store, group=prev_group, consolidated=False)
+        prev_ds = _open_level(store, i - 1)
 
         curr_ds = getattr(
             prev_ds.coarsen({x_dim: 2, y_dim: 2}, boundary="trim"), method
@@ -102,15 +126,7 @@ def write_pyramid(
             if var in template_ds:
                 curr_ds[var].attrs = template_ds[var].attrs
 
-        curr_store, curr_group = _level_store(store, i)
-        curr_ds.to_zarr(
-            curr_store,
-            group=curr_group,
-            mode="a",
-            encoding=enc,
-            zarr_format=zarr_format,
-            consolidated=False,
-        )
+        _write_level(curr_ds, store, i, enc, zarr_format)
 
     if consolidated and zarr_format != 3:
         zarr.consolidate_metadata(store)
