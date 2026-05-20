@@ -66,9 +66,10 @@ def write_pyramid(
             zarr_format=zarr_format,
             consolidated=False,
         )
+        zarr.consolidate_metadata(_level_store(level))
 
     def _open_level(level: int) -> xr.Dataset:
-        return xr.open_zarr(_level_store(level), consolidated=False)
+        return xr.open_zarr(_level_store(level), consolidated=True)
 
     n_levels = len(pyramid.encoding)
 
